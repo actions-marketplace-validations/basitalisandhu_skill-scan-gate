@@ -1,6 +1,6 @@
 # Rules
 
-skill-scan-gate has 32 rules in seven families. Each finding carries a rule id, a severity (low, medium or high), a path and 1-based line relative to the scanned directory, short evidence (secrets redacted) and the one-sentence remediation below.
+skill-scan-gate has 33 rules in seven families. Each finding carries a rule id, a severity (low, medium or high), a path and 1-based line relative to the scanned directory, short evidence (secrets redacted) and the one-sentence remediation below.
 
 The rules are text heuristics: nothing is executed and nothing is fetched. They catch the common, obvious shapes; a clean scan means nothing obvious matched, not that a repository is safe. See [false-positives.md](false-positives.md) for baselines and allowlists.
 
@@ -26,6 +26,7 @@ Files the scanner reads: `SKILL.md`, `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`
 | [SSG304](#ssg304) | high | Command dumps the environment |
 | [SSG305](#ssg305) | high | Command disables security tooling or permission checks |
 | [SSG306](#ssg306) | medium | Command evaluates a constructed string as code |
+| [SSG307](#ssg307) | low/medium | Hook matcher runs on every tool call |
 | [SSG401](#ssg401) | high | MCP server runs an npm package without an exact version |
 | [SSG402](#ssg402) | high | MCP server runs a Python package without an exact version |
 | [SSG403](#ssg403) | high | MCP server package uses the latest tag |
@@ -273,7 +274,13 @@ Remediation: Add a semantic version so users and lock files can tell releases ap
 
 **Name uses a reserved word or official-looking prefix.** Severity: medium
 
-What it catches: Plugin and marketplace names that start with anthropic or claude, marketplace names Claude Code reserves for official marketplaces (for example claude-plugins-official, anthropic-marketplace, agent-skills), and skill names that contain the reserved words anthropic or claude. The lists live in patterns.py; check them against the current Claude Code documentation.
+What it catches, following the Claude Code documentation (checked 2026-10-28):
+
+- Marketplace names Claude Code refuses ([reserved names](https://code.claude.com/docs/en/plugins/marketplace-reference#reserved-names)): the official, community and plugin directory names (for example `claude-plugins-official`, `knowledge-work-plugins`, `claude-plugins-community`, `claude-plugin-directory`), another spelling of one (a trailing dot, or any symbol other than an underscore in place of a hyphen, so `claude.code.plugins`), the names Claude Code uses itself (`inline`, `builtin`, `skills-dir`, `synced`, `claude-plugin-test`, `npm`, `pip`, `uv`, `cargo`, `github`, `gh`), JavaScript object member names such as `toString`, names starting with `claudeai-`, names with a non-ASCII character, and names that start with anthropic or claude or put official beside them.
+- Plugin names `claude plugin validate` reports as an error ([`name`](https://code.claude.com/docs/en/plugins/manifest-reference#name)): `claude`, `anthropic`, `anthropics`, `claude-code`, `claude-mods`, names starting with `claude-`, `anthropic-`, `anthropics-` or `cc-plugin-` (case and runs of separators ignored), and names that put official beside claude or anthropic. A whole word elsewhere, such as `mcp-for-claude`, is only a validator warning and is not flagged.
+- Skill names that contain the reserved words anthropic or claude (Agent Skills naming rules).
+
+The lists live in `src/skill_scan_gate/patterns.py` with the date they were last checked.
 
 Remediation: Rename the plugin, skill or marketplace so it cannot be mistaken for an official one.
 
@@ -308,6 +315,14 @@ Remediation: Fix the JSON syntax; Claude Code skips or rejects a file it cannot 
 What it catches: `allowed-tools` containing exact `Bash` or `Bash(*)`, in comma-separated, flow-list or block-list form. Scoped command declarations such as `Bash(git status *)` are not flagged. This is a breadth warning, not a claim that declaring a tool executes it.
 
 Remediation: Scope Bash to the commands the skill needs.
+
+### SSG307
+
+**Hook matcher runs on every tool call.** Severity: low, or medium when the same group contains a command that produces SSG202 or invokes `curl`/`wget`.
+
+What it catches: missing, empty, `*` and `.*` matchers on tool-name events (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest` and `PermissionDenied`). Empty handler groups and non-tool events are ignored. `Bash`, `Edit|Write` and `mcp__.*` remain restricted matchers. Each group produces one finding; a dangerous command in a different group cannot promote it.
+
+Remediation: Restrict the matcher to the tools the hook needs and review every command in the group.
 
 ## Repository files (SSG7xx)
 

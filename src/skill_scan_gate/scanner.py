@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import _jsondepth
 from . import patterns as P
 from .discover import (
     HOOKS_CONFIG,
@@ -39,10 +40,11 @@ class Finding:
     line: int
     evidence: str
     fingerprint: str
+    severity_override: str | None = None
 
     @property
     def severity(self) -> str:
-        return RULES[self.rule].severity
+        return self.severity_override or RULES[self.rule].severity
 
     @property
     def title(self) -> str:
@@ -56,7 +58,7 @@ class Finding:
         r = RULES[self.rule]
         return {
             "rule": self.rule,
-            "severity": r.severity,
+            "severity": self.severity,
             "family": r.family,
             "title": r.title,
             "file": self.file,
@@ -174,14 +176,24 @@ class Scanner:
         self.findings: list[Finding] = []
         self.errors: list[str] = []
         self.files: list[str] = []
-        self._seen: set[tuple[str, str, int]] = set()
+        self._seen: set[tuple[str, str, int, str]] = set()
         self._occ: dict[tuple[str, str, str], int] = {}
         self._mcp_done: set[str] = set()
 
     # ---------------------------------------------------------------- plumbing
 
-    def add(self, rule: str, file: str, line: int, source: str, evidence: str | None = None) -> None:
-        key = (rule, file, line)
+    def add(
+        self,
+        rule: str,
+        file: str,
+        line: int,
+        source: str,
+        evidence: str | None = None,
+        *,
+        severity: str | None = None,
+        discriminator: str = "",
+    ) -> None:
+        key = (rule, file, line, discriminator)
         if key in self._seen:
             return
         self._seen.add(key)
@@ -196,6 +208,7 @@ class Scanner:
                 line,
                 _clip(evidence if evidence is not None else source),
                 fingerprint(rule, file, source, occ),
+                severity,
             )
         )
 
@@ -215,11 +228,15 @@ class Scanner:
 
     def load_json(self, rel: str, text: str) -> Any:
         try:
-            return json.loads(text)
+            return _jsondepth.loads(text)
         except json.JSONDecodeError as e:
             lines = text.splitlines()
             src = lines[e.lineno - 1] if 0 < e.lineno <= len(lines) else ""
             self.add("SSG606", rel, e.lineno, src, f"{e.msg} at line {e.lineno} column {e.colno}")
+            return None
+        except RecursionError:
+            first = text.splitlines()[0] if text else ""
+            self.add("SSG606", rel, 1, first, "JSON nested too deeply to parse")
             return None
 
     # ---------------------------------------------------------------- entry point
@@ -331,6 +348,43 @@ class Scanner:
     def hook_config_rules(self, rel: str, text: str, data: dict[str, Any]) -> None:
         for event, command in hook_commands(data.get("hooks")):
             self.command_rules(rel, locate(text, event, command), command)
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            return
+        for event in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied"):
+            groups = hooks.get(event)
+            if not isinstance(groups, list):
+                continue
+            for index, group in enumerate(groups):
+                if not isinstance(group, dict):
+                    continue
+                matcher = group.get("matcher", "")
+                if not isinstance(matcher, str) or matcher not in ("", "*", ".*"):
+                    continue
+                handlers = group.get("hooks")
+                if not isinstance(handlers, list) or not any(isinstance(h, dict) and h.get("type") for h in handlers):
+                    continue
+                commands = [command for _, command in hook_commands({event: [group]})]
+                risky = False
+                for command in commands:
+                    # Reuse command rules so promotion follows their future fixes too.
+                    probe = Scanner(self.root, self.exclude, self.blob_min)
+                    probe.command_rules(rel, 1, command)
+                    risky |= any(f.rule == "SSG202" for f in probe.findings)
+                    risky |= bool(P.NETWORK_VERB.search(command))
+                source = json.dumps(group, sort_keys=True)
+                evidence = f"{event} matcher {matcher!r} runs on every tool call"
+                if risky:
+                    evidence += "; this group also contains a command that uploads a file or invokes curl/wget"
+                self.add(
+                    "SSG307",
+                    rel,
+                    locate(text, event, commands[0] if commands else "hooks"),
+                    source,
+                    evidence,
+                    severity=MEDIUM if risky else LOW,
+                    discriminator=f"{event}:{index}",
+                )
 
     # ---------------------------------------------------------------- markdown rules
 
@@ -430,11 +484,10 @@ class Scanner:
         return secret_lines
 
     def _reserved_name(self, rel: str, text: str, name: str, plugin: bool) -> None:
-        low = name.lower()
-        hit = low in P.RESERVED_MARKETPLACE_NAMES or any(low.startswith(w) for w in P.RESERVED_WORDS)
-        if hit:
+        reason = P.reserved_plugin_reason(name) if plugin else P.reserved_marketplace_reason(name)
+        if reason:
             kind = "plugin" if plugin else "marketplace"
-            self.add("SSG603", rel, locate(text, f'"{name}"'), f"{kind} name: {name}")
+            self.add("SSG603", rel, locate(text, f'"{name}"'), f"{kind} name: {name}", f"{kind} name {name!r} {reason}")
 
     def _follow_mcp_ref(self, rel: str, ref: Any) -> None:
         if not isinstance(ref, str) or not ref.startswith("./") or ".." in ref.split("/"):
